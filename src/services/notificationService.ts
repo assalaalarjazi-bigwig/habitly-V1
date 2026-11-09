@@ -14,7 +14,7 @@ export interface InAppNotification {
 
 type NotificationListener = (notification: InAppNotification) => void;
 
-export const NOTIFICATION_CHANNEL_ID = 'habit_reminders_v2';
+export const NOTIFICATION_CHANNEL_ID = 'habit_reminders_v3';
 export const NOTIFICATION_SOUND_FILE = 'habit_alert.wav';
 
 /**
@@ -32,9 +32,11 @@ function hashStringToId(str: string): number {
 class NotificationService {
   private listeners: Set<NotificationListener> = new Set();
   private timer: number | null = null;
-  private scheduledReminders: Map<string, string> = new Map(); // habitId -> HH:MM
+  private scheduledReminders: Map<string, { time: string; name: string }> = new Map(); // habitId -> { time: HH:MM, name }
   private isNative: boolean = false;
   private channelCreated: boolean = false;
+  private lastFiredTracker: Map<string, string> = new Map(); // habitId -> YYYY-MM-DD to avoid duplicates
+  private lastHabitsHash: string = '';
 
   constructor() {
     this.isNative = Capacitor.isNativePlatform();
@@ -49,9 +51,10 @@ class NotificationService {
     if (!this.isNative) return;
 
     try {
-      // Remove obsolete channel if it existed without sound
+      // Clean up older channels if any
       try {
         await LocalNotifications.deleteChannel({ id: 'habit_reminders' });
+        await LocalNotifications.deleteChannel({ id: 'habit_reminders_v2' });
       } catch {
         // Channel delete is optional
       }
@@ -59,7 +62,7 @@ class NotificationService {
       await LocalNotifications.createChannel({
         id: NOTIFICATION_CHANNEL_ID,
         name: 'تذكيرات العادات والمنبه | Habit Reminders',
-        description: 'إشعارات وتنبيهات صوتية فورية لمواعيد إنجاز العادات اليومية في موعدها',
+        description: 'إشعارات وتنبيهات صوتية فورية لمواعيد إنجاز العادات اليومية في موعدها الدقيق',
         importance: 5, // High / Heads-up notification with sound & vibration
         visibility: 1, // Public visibility on lockscreen
         sound: NOTIFICATION_SOUND_FILE,
@@ -153,56 +156,64 @@ class NotificationService {
 
   /**
    * Sync and schedule native repeating alarms for all active habits
-   * Operates completely in the background via Android AlarmManager / NotificationManager
+   * Uses exact `on: { hour, minute }` schedule syntax which Android AlarmManager
+   * evaluates strictly at that time without any immediate catch-up burst!
    */
   public async syncHabits(habits: Habit[]) {
-    this.scheduledReminders.clear();
+    // 1. Compute stable hash of active reminders to prevent re-scheduling if unchanged
+    const reminderItems = habits
+      .filter((h) => h.reminderEnabled && Boolean(h.reminderTime))
+      .map((h) => `${h.id}_${h.reminderTime}_${h.name}`)
+      .sort();
+    const currentHash = reminderItems.join('|');
 
-    const remindersToSchedule: { habit: Habit; hour: number; minute: number }[] = [];
+    // Always update in-memory map for the foreground timer
+    this.scheduledReminders.clear();
+    const validReminders: { habit: Habit; hour: number; minute: number }[] = [];
 
     habits.forEach((h) => {
       if (h.reminderEnabled && h.reminderTime) {
-        this.scheduledReminders.set(h.id, h.reminderTime);
         const [hourStr, minStr] = h.reminderTime.split(':');
         const hour = parseInt(hourStr, 10);
         const minute = parseInt(minStr, 10);
         if (!isNaN(hour) && !isNaN(minute)) {
-          remindersToSchedule.push({ habit: h, hour, minute });
+          this.scheduledReminders.set(h.id, { time: h.reminderTime, name: h.name });
+          validReminders.push({ habit: h, hour, minute });
         }
       }
     });
+
+    // If native schedules haven't changed, skip re-scheduling to avoid clearing/re-creating alarms
+    if (this.isNative && currentHash === this.lastHabitsHash) {
+      return;
+    }
+    this.lastHabitsHash = currentHash;
 
     if (this.isNative) {
       try {
         await this.initNativeChannel();
 
-        // 1. Cancel previous pending notifications
+        // Cancel previous pending notifications
         const pending = await LocalNotifications.getPending();
         if (pending.notifications.length > 0) {
           await LocalNotifications.cancel({ notifications: pending.notifications });
         }
 
-        if (remindersToSchedule.length === 0) return;
+        if (validReminders.length === 0) return;
 
-        // 2. Build repeating daily notification schemas with alert sound
-        const now = new Date();
-        const notificationBatch = remindersToSchedule.map(({ habit, hour, minute }) => {
-          const target = new Date();
-          target.setHours(hour, minute, 0, 0);
-
-          // If the time has already passed today, start from tomorrow
-          if (target.getTime() <= now.getTime()) {
-            target.setDate(target.getDate() + 1);
-          }
-
+        // Schedule using `schedule.on: { hour, minute }`
+        // In Capacitor LocalNotifications on Android, `on` matches the exact cron time.
+        // It NEVER executes immediately upon scheduling if the time has passed today!
+        const notificationBatch = validReminders.map(({ habit, hour, minute }) => {
           return {
             id: hashStringToId(habit.id),
             title: `⏰ تذكير بعادة: ${habit.name}`,
             body: `حان موعد إنجاز عادتك اليومية "${habit.name}"! حافظ على سلسلتك اليومية ✨`,
             schedule: {
-              at: target,
-              repeats: true,
-              every: 'day' as const,
+              on: {
+                hour,
+                minute,
+              },
               allowWhileIdle: true,
             },
             channelId: NOTIFICATION_CHANNEL_ID,
@@ -220,7 +231,7 @@ class NotificationService {
           notifications: notificationBatch,
         });
 
-        console.log(`Successfully scheduled ${notificationBatch.length} native alarms with audio alert on channel ${NOTIFICATION_CHANNEL_ID}.`);
+        console.log(`Successfully scheduled ${notificationBatch.length} exact alarms using 'on: {hour, minute}' syntax.`);
       } catch (err) {
         console.warn('Failed to schedule native local notifications:', err);
       }
@@ -233,7 +244,14 @@ class NotificationService {
       return;
     }
 
-    this.scheduledReminders.set(habit.id, habit.reminderTime);
+    const [hStr, mStr] = habit.reminderTime.split(':');
+    const hour = parseInt(hStr, 10);
+    const minute = parseInt(mStr, 10);
+
+    if (isNaN(hour) || isNaN(minute)) return;
+
+    this.scheduledReminders.set(habit.id, { time: habit.reminderTime, name: habit.name });
+    this.lastHabitsHash = ''; // Reset hash so sync stays in sync
 
     if (this.isNative) {
       try {
@@ -243,39 +261,27 @@ class NotificationService {
         // Cancel existing notification for this habit first
         await LocalNotifications.cancel({ notifications: [{ id }] });
 
-        const [hStr, mStr] = habit.reminderTime.split(':');
-        const hour = parseInt(hStr, 10);
-        const minute = parseInt(mStr, 10);
-
-        if (!isNaN(hour) && !isNaN(minute)) {
-          const now = new Date();
-          const target = new Date();
-          target.setHours(hour, minute, 0, 0);
-          if (target.getTime() <= now.getTime()) {
-            target.setDate(target.getDate() + 1);
-          }
-
-          await LocalNotifications.schedule({
-            notifications: [
-              {
-                id,
-                title: `⏰ تذكير بعادة: ${habit.name}`,
-                body: `حان موعد إنجاز عادتك اليومية "${habit.name}"! حافظ على سلسلتك اليومية ✨`,
-                schedule: {
-                  at: target,
-                  repeats: true,
-                  every: 'day',
-                  allowWhileIdle: true,
+        await LocalNotifications.schedule({
+          notifications: [
+            {
+              id,
+              title: `⏰ تذكير بعادة: ${habit.name}`,
+              body: `حان موعد إنجاز عادتك اليومية "${habit.name}"! حافظ على سلسلتك اليومية ✨`,
+              schedule: {
+                on: {
+                  hour,
+                  minute,
                 },
-                channelId: NOTIFICATION_CHANNEL_ID,
-                sound: NOTIFICATION_SOUND_FILE,
-                smallIcon: 'ic_stat_habit',
-                iconColor: '#10B981',
-                extra: { habitId: habit.id },
+                allowWhileIdle: true,
               },
-            ],
-          });
-        }
+              channelId: NOTIFICATION_CHANNEL_ID,
+              sound: NOTIFICATION_SOUND_FILE,
+              smallIcon: 'ic_stat_habit',
+              iconColor: '#10B981',
+              extra: { habitId: habit.id, habitName: habit.name },
+            },
+          ],
+        });
       } catch (err) {
         console.warn('Failed to schedule single native reminder:', err);
       }
@@ -284,6 +290,8 @@ class NotificationService {
 
   public async cancelHabitReminder(habitId: string) {
     this.scheduledReminders.delete(habitId);
+    this.lastHabitsHash = '';
+
     if (this.isNative) {
       try {
         const id = hashStringToId(habitId);
@@ -296,9 +304,10 @@ class NotificationService {
 
   /**
    * Broadcast an in-app and/or system notification immediately with sound
+   * Used for explicit triggers (like unlocking achievements or manual test button)
    */
   public async triggerNotification(title: string, body: string, habitName?: string, icon?: string) {
-    // 0. Trigger audio chime alert immediately!
+    // 0. Trigger audio chime alert
     soundService.playReminderAlert();
 
     const item: InAppNotification = {
@@ -310,7 +319,7 @@ class NotificationService {
       timestamp: Date.now(),
     };
 
-    // 1. In-app listeners (active toast if app is currently visible)
+    // 1. In-app toast listeners
     this.listeners.forEach((listener) => {
       try {
         listener(item);
@@ -319,7 +328,7 @@ class NotificationService {
       }
     });
 
-    // 2. Native System Notification (triggers Android Notification Shade / Lock Screen with sound & vibration)
+    // 2. Native System Notification (immediate)
     if (this.isNative) {
       try {
         await this.initNativeChannel();
@@ -330,7 +339,7 @@ class NotificationService {
               title,
               body,
               schedule: {
-                at: new Date(Date.now() + 500), // Fire almost immediately
+                at: new Date(Date.now() + 400),
                 allowWhileIdle: true,
               },
               channelId: NOTIFICATION_CHANNEL_ID,
@@ -360,34 +369,42 @@ class NotificationService {
   }
 
   /**
-   * In-app fallback loop for when the app is actively open in foreground
+   * Foreground checker: Fires in-app notification ONLY when the exact minute arrives right now.
+   * Tracks date+time to ensure it only fires once per day per habit!
    */
   private startInAppReminderChecker() {
     if (typeof window === 'undefined') return;
 
-    let lastFiredMinute = '';
+    let lastCheckedMinute = '';
 
     this.timer = window.setInterval(() => {
       const now = new Date();
       const currentMinute = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      const todayDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-      if (currentMinute === lastFiredMinute) return;
-      lastFiredMinute = currentMinute;
+      if (currentMinute === lastCheckedMinute) return;
+      lastCheckedMinute = currentMinute;
 
-      this.scheduledReminders.forEach((time, habitId) => {
-        if (time === currentMinute) {
-          // If we are NOT native, fire in-app/web notification and sound
-          // (On native, the system AlarmManager fires it automatically with audio)
-          if (!this.isNative) {
-            this.triggerNotification(
-              '⏰ تذكير بعادة | Habit Reminder',
-              `حان الوقت لإنجاز عادتك اليومية! حافظ على سلسلتك! ✨`,
-              habitId
-            );
+      // Only evaluate when active in foreground on Web or desktop
+      // (On Native Android, AlarmManager will handle background/lock screen)
+      if (this.isNative) return;
+
+      this.scheduledReminders.forEach((reminder, habitId) => {
+        if (reminder.time === currentMinute) {
+          const firedKey = `${habitId}_${todayDate}_${currentMinute}`;
+          if (this.lastFiredTracker.get(habitId) === firedKey) {
+            return; // Already fired today for this minute
           }
+          this.lastFiredTracker.set(habitId, firedKey);
+
+          this.triggerNotification(
+            `⏰ تذكير بعادة: ${reminder.name}`,
+            `حان موعد إنجاز عادتك اليومية "${reminder.name}"! حافظ على سلسلتك اليومية ✨`,
+            habitId
+          );
         }
       });
-    }, 15000);
+    }, 10000); // Check every 10 seconds
   }
 }
 
